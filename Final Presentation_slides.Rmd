@@ -1,0 +1,533 @@
+
+---
+title: "Restaurant Inspections & Neighborhood Characteristics in NYC"
+subtitle: "R Final Project – Descriptive & Empirical Strategy"
+author: "Janhavi Chanda | Divya Sridhar | Pranav Mehta"
+institute: "Columbia University | SIPA"
+output:
+  xaringan::moon_reader:
+    self_contained: true
+    lib_dir: libs
+    nature:
+      highlightStyle: github
+      highlightLines: true
+      countIncrementalSlides: false
+---   
+<style>
+.title-slide {
+  background-image: url("https://images.unsplash.com/photo-1655562378704-d5d0a8c3d442?q=80&w=1625&auto=format&fit=crop&ixlib=rb-4.1.0&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D");
+  background-size: cover;
+  background-position: center;
+  }
+  
+  blockquote {
+  border-left: 4px solid #00aaff;
+  background-color: #f0f8ff;
+  padding: 10px 15px;
+  margin: 20px 0;
+  font-style: italic;
+  color: #333;
+}
+
+.purple-block {
+  display: inline-block; 
+  border: 2px solid #6a0dad; 
+  background-color: #e6d5f7; 
+  color: #000; 
+  padding: 2px 8px; 
+  border-radius: 5px; 
+  margin: 0; 
+}
+
+.text-plot-container {
+  display: flex;
+  align-items: center; 
+}
+
+.text-plot-container .text {
+  flex: 1; 
+  margin-right: 20px; 
+}
+
+.text-plot-container .plot {
+  flex: 2; 
+}
+
+.custom-table table {
+  font-size: 12px;
+  width: auto;
+  margin: 0 auto;
+}
+
+.custom-table th, .custom-table td {
+  padding: 5px;
+}
+
+.scrollable {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+
+.research-box {
+  border: 2px solid #6a0dad;
+  background-color: #f5ecff;
+  padding: 12px 16px;
+  border-radius: 6px;
+  margin-top: 15px;
+  margin-bottom: 15px;
+  font-size: 1.1em;
+}
+
+.small-text p,
+.small-text li {
+  font-size: 0.9em;
+  line-height: 1.25;
+}
+
+.small-text h2 {
+  font-size: 1.1em;   /* smaller than normal */
+  margin-bottom: 0.3em;
+}
+</style>
+
+```{r setup, include=FALSE}
+options(htmltools.dir.version = FALSE)
+knitr::opts_chunk$set(dev = "png")
+
+library(tidyverse)
+library(sf)
+library(modelsummary)
+library(tidycensus)
+library(lubridate)
+library(janitor)
+library(scales)
+library(tibble)
+library(kableExtra)
+library(dplyr)
+library(knitr)
+
+load("final_project_objects.RData")
+
+```
+
+# Policy Context
+
+## Why This Question Matters
+
+- NYC DOHMH conducts annual “random” restaurant inspections to ensure food safety and public health.
+- Restaurants with poor inspection outcomes face more frequent future inspections, public letter-grade posting, and significant financial penalties
+- Prior evidence shows uneven inspection patterns across boroughs, cuisines, and neighborhoods, suggesting potential inequities
+- If inspection frequency correlates with neighborhood socioeconomic characteristics, random checks may not be random, creating disproportionate burdens for restaurants in poorer areas
+
+## Our Focus
+
+- Do lower-income census tracts receive more inspections?
+- How do neighborhood characteristics relate to inspection intensity?
+- Are patterns consistent across boroughs?
+
+---
+
+# Research question(s)
+
+<div class="research-box">
+<strong>Is the restaurant inspection intensity higher in poorer census tracts across New York City?</strong><br/>
+
+</div>
+
+## Potential follow-up research questions 
+
+- Are other census tract characteristics (such as racial composition, immigrant population etc.) also associated with restaurant inspection intensity?
+- How have these relationships changed over time?
+- Does the association between income level and restaurant inspection intensity vary by borough?
+- Can we also study relationships related to inspection outcomes in a robust way?
+
+---
+
+# Data description
+
+We will be **merging two datasets on census tract** so we can pair information on restaurant inspections and neighborhood characteristics at the tract level.
+
+<div class="custom-table scrollable">
+
+```{r data-description-table, echo=FALSE, message=FALSE, warning=FALSE}
+
+ins_date_range <- range(dohmh$inspection_date, na.rm = TRUE)
+ins_year_range <- paste0(year(ins_date_range[1]), "–", year(ins_date_range[2]))
+n_inspections  <- comma(nrow(dohmh))
+n_restaurants  <- comma(n_distinct(dohmh$camis))
+
+n_tracts       <- comma(n_distinct(tract_sf$geoid))
+
+data_sources <- tribble(
+  ~`Dataset`, ~`Unit of observation`, ~`Time period`, ~`Size`, ~`Key variables (examples)`,
+
+  "DOHMH NYC Restaurant Inspection Results",
+  "One restaurant inspection event",
+  ins_year_range,
+  paste0(n_inspections, " inspections (", n_restaurants, " restaurants)"),
+  "Restaurant ID, borough, cuisine, inspection date, score, grade, ZIP, census tract, coordinates",
+
+  "ACS 5-year Census Data (NYC tracts)",
+  "One census tract",
+  paste0(ins_year_range, " (ACS 5-year estimates)"),
+  paste0(n_tracts, " tracts"),
+  "Median income, poverty rate, race/ethnicity shares, foreign-born share, total population"
+)
+
+kable(
+  data_sources,
+  format = "html",
+  align = "l"
+) |>
+  kable_styling(full_width = FALSE, font_size = 15) |>
+  column_spec(1, bold = TRUE)
+```
+---
+
+# Main analysis data frame
+
+- Unit of analysis: **NYC census tract**
+- Each row combines:
+  - Aggregated DOHMH inspection activity (2019–2023)
+  - ACS 5-year socioeconomic and demographic characteristics
+- This is the dataset we use for descriptive plots and regressions
+
+<div class="custom-table scrollable">
+
+```{r var-description, echo=FALSE, message=FALSE, warning=FALSE}
+library(tibble)
+library(kableExtra)
+
+var_desc <- tribble(
+  ~`Variable`, ~`Description`, ~`Unit / notes`,
+  "geoid", "Census tract identifier (FIPS code)", "ID",
+  "pop_total", "Total population in tract", "Count of residents",
+  "n_restaurants", "Number of unique restaurants", "Count of CAMIS in tract",
+  "total_inspections", "Total inspections over sample period", "Count",
+  "inspections_per_rest", "Inspections per restaurant", "Total_inspections / n_restaurants",
+  "inspections_per_1000_pop", "Inspections per 1,000 residents", "Total_inspections / pop_total × 1,000",
+  "median_income", "Median household income", "USD (ACS 5-year)",
+  "pct_poverty", "Population below poverty line", "Percent of residents",
+  "pct_white / pct_black / pct_hispanic", "Race / ethnicity composition", "Percent of residents",
+  "pct_foreign_born", "Foreign-born share", "Percent of residents"
+)
+
+kable(var_desc, format = "html", align = "l") |>
+  kable_styling(full_width = FALSE, font_size = 14)
+```
+</div>
+
+---
+
+# Descriptive statistics (tract level)
+
+## Key variables in our tract-level dataset
+
+```{r tract-skim-slide, echo=FALSE, message=FALSE, warning=FALSE}
+datasummary_skim(
+  tract_skim_df,
+  type = "numeric",
+  output = "kableExtra"
+) |>
+  kable_styling(full_width = FALSE, font_size = 13)
+```
+---
+# Monthly inspection volume
+
+```{r monthly-volume-slide, echo=FALSE, message=FALSE, warning=FALSE,fig.width=13, fig.height=9, dpi=300, out.width="100%"}
+dohmh %>%
+  mutate(month = floor_date(inspection_date, "month")) %>%
+  count(month) %>%
+  ggplot(aes(month, n)) +
+  geom_line() +
+  geom_point(size = 0.6) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Chart 1: Monthly DOHMH Restaurant Inspections (2019–2023)",
+    x = "Month",
+    y = "Number of inspections"
+  ) +
+  theme_minimal()+
+  theme(
+    plot.title = element_text(size = 25, face="bold"),
+    axis.title = element_text(size = 20),
+    axis.text  = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 18)
+  )
+```
+---
+
+# Spatial pattern of inspections by year
+
+```{r faceted-map-slide, echo=FALSE, message=FALSE, warning=FALSE, fig.width=13, fig.height=9, dpi=300, out.width="100%"}
+years_to_plot <- 2019:2023
+
+dohmh_years_sf <- dohmh_sf %>%
+  mutate(year = lubridate::year(inspection_date)) %>%
+  filter(
+    !is.na(year),
+    year %in% years_to_plot,
+    longitude > -75, longitude < -72,
+    latitude  >  40,  latitude  <  42
+  )
+
+ggplot() +
+  geom_sf(data = tract_sf,
+          fill  = "grey95",
+          color = "grey75",
+          size  = 0.1) +
+  geom_sf(data = dohmh_years_sf,
+          color = "red",
+          alpha = 0.25,
+          size  = 0.2) +
+  coord_sf(
+    xlim = c(-74.3, -73.6),
+    ylim = c(40.48, 40.95),
+    expand = FALSE
+  ) +
+  facet_wrap(~ year) +
+  theme_minimal() +
+  labs(
+    title   = "Chart 2: NYC DOHMH Restaurant Inspections by Year (2019–2023)",
+    x = NULL,
+    y = NULL
+  ) +
+  theme(
+    axis.text  = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 25, face="bold"),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 18)
+  )
+```
+---
+
+# Inspections per 1,000 residents
+
+```{r map-map-intensity-1000, echo=FALSE, message=FALSE, warning=FALSE,fig.width=13, fig.height=9, dpi=300, out.width="100%"}
+
+ggplot(tract_level_binned) +
+  geom_sf(aes(fill = insp_cat), color = NA) +
+  scale_fill_manual(
+    name   = "Inspection intensity",
+    values = c(
+      "Low"    = "#2C7BB6",
+      "Medium" = "#FDAE61",
+      "High"   = "#D7191C"
+    ),
+    na.value = "grey90"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Chart 3: NYC Census Tracts: L/M/H Inspections per 1,000 Residents",
+    fill  = "Inspections\nper 1,000 residents"
+  ) +
+  theme(
+    axis.text  = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 25, face="bold"),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 18)
+  )
+```
+---
+
+# Income × inspection intensity (bivariate)
+
+```{r bivariate-map-slide, echo=FALSE, message=FALSE, warning=FALSE,fig.width=13, fig.height=9, dpi=300, out.width="100%"}
+ggplot(tract_bivar) +
+  geom_sf(aes(fill = bivar_cat), color = NA) +
+  scale_fill_manual(
+    values    = bivar_pal,
+    na.value  = "grey90",
+    name      = "Income × Inspection\nIntensity"
+  ) +
+  theme_minimal() +
+  labs(
+    title    = "Chart 4: NYC Census Tracts: Income and Inspection Intensity",
+    subtitle = "Income (rows) × Inspections per Square Mile (columns)"
+  ) +
+  theme(
+    legend.position = "right",
+    axis.text       = element_blank(),
+    axis.title      = element_blank(),
+    panel.grid      = element_blank(),
+    plot.title = element_text(size = 25, face="bold"),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 18)
+
+  )
+```
+
+---
+
+# Bivariate legend
+
+```{r bivariate-legend-slide, echo=FALSE, message=FALSE, warning=FALSE,fig.width=13, fig.height=9, dpi=300, out.width="100%"}
+ggplot(legend_df, aes(x = insp, y = income, fill = cat)) +
+  geom_tile() +
+  scale_fill_manual(values = bivar_pal) +
+  scale_x_continuous(breaks = 1:3, labels = c("Low", "Med", "High")) +
+  scale_y_continuous(breaks = 1:3, labels = c("Low", "Med", "High")) +
+  labs(
+    x = "Inspection intensity",
+    y = "Income",
+    title = "Legend: Income (rows) × Inspection intensity (columns)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 25, face="bold"),
+    axis.title = element_text(size = 20)
+)
+```
+
+---
+
+# Inspection intensity across income deciles
+
+```{r decile-intensity-slide, echo=FALSE, message=FALSE, warning=FALSE,fig.width=13, fig.height=9, dpi=300, out.width="100%"}
+ggplot(tract_summary,
+       aes(x = income_decile_label,
+           y = median_insp)) +
+  geom_point(size = 3, color = "#1f78b4") +
+  geom_errorbar(aes(ymin = q1, ymax = q3),
+                width = 0.2, color = "#1f78b4") +
+  labs(
+    x = "Income decile (1 = lowest-income neighborhoods, 10 = highest)",
+    y = "Median (IQR) inspections per restaurant",
+    title = "Chart 5: Inspection Intensity Across Neighborhood Income Levels"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 25, face="bold"),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 18),
+    axis.title = element_text(size = 20)
+  )
+```
+
+---
+
+# Empirical strategy: Setting the scene
+
+- **Unit of analysis**: Census tracts in New York City
+
+- **Outcome variable**: Restaurant inspection intensity  
+  - **Ideal**: Construct a variable that captures number of restaurant inspections per census tract as a share of total restaurants in that census tract  
+  - **Challenge:** Lack of a comprehensive dataset that lists all restaurants per census tract in New York City  
+    - **Solution:** Use total population per census tract as a proxy for number of restaurants, and construct a variable for number of restaurant inspections per 1,000 residents in a census tract
+
+- **Key explanatory variable**: Some measure of income level / poverty (such as median household income level, poverty share, etc.)
+
+- **Time component**: We will use a panel dataset consisting of the years in common between the two datasets
+---
+
+# Empirical strategy: The analysis
+
+- At this stage, we are not exploring the impact of any treatment (i.e., policy change or another
+source of variation) on restaurant inspections. 
+- Instead, we plan to conduct in-depth exploratory analysis to investigate potential relationships between census tract characteristics and restaurant inspection intensity. 
+
+Our **proposed basic PRF** is:
+
+<div class="research-box" style="text-align:center; font-size: 1.1em;">
+
+\[
+\text{Inspection intensity}_{it}
+= \beta_0 + \beta_1 \,\text{Income}_{it} + \beta_2 X_{it} + \varepsilon_{it}
+\]
+
+</div>
+
+Where:
+
+- ``\( i \)`` and ``\( t \)`` represent a particular census tract and year  
+- Restaurant inspection intensity is measured as **total inspections per 1,000 residents**  
+- Income is measured as ``\( \text{median household income}_{it} \)`` in the census tract  
+- ``\( X_{it} \)`` refers to the set of other explanatory variables we will use (e.g., poverty rate,
+  racial/ethnic composition, immigrant population share)
+
+---
+
+# Limitations & Mitigations (1/2)
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+
+lim_table1 <- data.frame(
+  Limitation = c(
+    "Lack of historical restaurant counts per tract",
+    "Unbalanced inspection counts across years"
+  ),
+  Mitigation = c(
+    "- Use restaurants observed in our dataset as proxy<br>
+     - Use square mileage or commercial zoning area<br>
+     - Validate proxy using cuisine clusters / zip codes",
+    
+    "- Restrict to 2021–2023 where inspections stabilize<br>
+     - Weight observations by annual sample size"
+  )
+)
+
+kable(
+  lim_table1,
+  format = "html",
+  escape = FALSE,  # allows <br> to render properly
+  align = c("l","l"),
+  col.names = c("Limitation", "Possible Mitigations")
+)
+```
+
+---
+
+# Limitations & Mitigations (2/2)
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+
+lim_table2 <- data.frame(
+  Limitation = c(
+    "ACS data only available through 2023",
+    "Initial regressions show low significance"
+  ),
+  Mitigation = c(
+    "- Limit final dataset to 2019–2023<br>
+     - Impute 2024–2025 using lagged ACS values<br>
+     - Run sensitivity checks with and without imputed years",
+    
+    "- Improve measurement of inspection intensity<br>
+     - Add richer controls (borough FE, tract FE)<br>
+     - Explore nonlinear forms and alternative specifications<br>
+     - Conduct robustness checks"
+  )
+)
+
+kable(
+  lim_table2,
+  format = "html",
+  escape = FALSE,  # allows <br> to render properly
+  align = c("l","l"),
+  col.names = c("Limitation", "Possible Mitigations")
+)
+```
+---
+
+# Next steps
+
+- **Finalise our dataset:** Complete construction of inspection intensity measures and determine the workable panel timespan.
+
+- **Refine our regressions:**  Decide which explanatory variables to include, incorporate **fixed effects** and **time effects**, and conduct deeper investigation into variables that show meaningful relationships.
+
+---
+
+class: center, middle
+
+<div class="research-box" style="font-size: 1.8em; text-align:center;">
+<strong>Thank you!</strong><br/>
+</div>

@@ -1,0 +1,672 @@
+---
+title: "R Final Project: Data Analysis"
+output: html_document
+date: sys_date()
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 0. Setup
+
+- tidyverse handles data wrangling and plotting 
+- lubridate deals with dates
+- janitor helps clean column names 
+- modelsummary formats tables
+- scales helps with pretty labels (like dollar signs)
+- tidycensus accesses Census/ACS data
+- sf handles spatial (geographic) data 
+- The line options(scipen = 999) tells R not to use scientific notation for numbers (e.g., it will print 100000 instead of 1e+05), which makes numerical output easier to read
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(modelsummary)
+library(scales)
+library(tidycensus)
+library(sf)
+library(gganimate)
+library(gifski)
+library(ggridges)
+
+options(scipen = 999)
+analysis_year_min <- 2019
+analysis_year_max <- 2023
+
+```
+
+# 1. Download & clean DOHMH inspections (2015–2024)
+
+This chunk fetches and cleans NYC restaurant inspection data. First, it sets the Census API key. Then it downloads the DOHMH inspections dataset from the NYC Open Data portal as a CSV, cleans the column names to snake_case, and creates a cleaned dohmh dataset. In transmute, it keeps and renames key variables: restaurant ID (camis), name (dba), borough, cuisine type, inspection date, inspection score, grade, inspection type, zip code, census tract, and coordinates. It parses inspection_date into a proper Date, converts score, latitude, and longitude to numeric (safely ignoring non-numeric entries), and filters to inspections between January 1, 2015 and December 31, 2024[**TO BE EDITED BASED ON ANALYSIS**]. It also adds a year variable from the inspection date. Finally, it converts the cleaned inspection data with valid coordinates into an sf point object (dohmh_sf) so each inspection is a spatial point in WGS84 (EPSG 4326).
+
+```{r}
+census_api_key("9c36512bceaf554c87d88817959c28384ca78366", install = FALSE)
+
+dohmh_url <- "https://data.cityofnewyork.us/api/views/43nn-pn8j/rows.csv?accessType=DOWNLOAD"
+
+dohmh_raw <- readr::read_csv(dohmh_url, guess_max = 750000) %>%
+  clean_names()
+
+dohmh <- dohmh_raw %>%
+  transmute(
+    camis,
+    dba,
+    boro = str_to_title(boro),
+    cuisine_description,
+    inspection_date = parse_date_time(
+      inspection_date,
+      orders = c("Y-m-d H:M:S", "Y-m-d", "m/d/Y H:M:S", "m/d/Y"),
+      quiet = TRUE
+    ) %>% as.Date(),
+    score = suppressWarnings(as.numeric(score)),
+    grade,
+    inspection_type,
+    zipcode,
+    census_tract,
+    latitude  = suppressWarnings(as.numeric(latitude)),
+    longitude = suppressWarnings(as.numeric(longitude))
+  ) %>%
+  filter(
+    !is.na(inspection_date),
+    inspection_date >= as.Date(paste0(analysis_year_min, "-01-01")),
+    inspection_date <= as.Date(paste0(analysis_year_max, "-12-31"))
+  ) %>%
+  mutate(year = year(inspection_date))
+
+# Convert to sf points
+dohmh_sf <- dohmh %>%
+  filter(!is.na(latitude), !is.na(longitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+
+total_raw_inspections <- nrow(dohmh_raw)
+total_analysis_inspections <- nrow(dohmh)
+n_unique_restaurants <- n_distinct(dohmh$camis)
+
+```
+
+# 2. Download ACS tract-level data for NYC
+
+This chunk pulls demographic and socioeconomic data at the census tract level for New York City from the 2022 ACS 5-year estimates. We define the five NYC counties by FIPS code, then set up a named vector of ACS variable codes for median income, poverty counts, total population, racial/ethnic counts, and foreign-born population. get_acs downloads these variables for all tracts in the selected counties, with geometries (polygons). We then reshape the ACS data from long to wide format so each tract (GEOID) has one row with all the selected variables as columns. We rename those columns to human-friendly names (like median_income, pov_count, etc.), and compute percentage variables: poverty rate, percent white, black, Hispanic, and foreign-born. Next, we extract unique tract geometries, joins on the wide ACS attributes, transforms to WGS84 (EPSG 4326), and cleans column names. Finally, we compute each tract’s area in square meters and convert it to square miles (area_sq_miles), so we can later calculate densities (e.g., inspections per square mile).
+
+```{r}
+# NYC counties (FIPS codes)
+nyc_counties <- c("005","047","061","081","085")
+
+acs_vars <- c(
+  median_income = "B19013_001",  # Median household income
+  pov_count     = "B17001_002",  # Persons below poverty
+  pop_total     = "B01003_001",  # Total population
+  white_count   = "B02001_002",
+  black_count   = "B02001_003",
+  hisp_count    = "B03003_003",
+  foreign_born  = "B05002_013"   # Foreign-born population
+)
+
+acs_geo <- get_acs(
+  geography = "tract",
+  variables = acs_vars,
+  state = "NY",
+  county = nyc_counties,
+  survey = "acs5",
+  year = 2023,
+  geometry = TRUE,
+  cache_table = TRUE
+)
+
+# Map ACS codes -> our names
+code_map <- setNames(names(acs_vars), acs_vars)
+
+acs_wide <- acs_geo %>%
+  st_drop_geometry() %>%
+  select(GEOID, variable, estimate) %>%
+  pivot_wider(names_from = variable, values_from = estimate) %>%
+  rename_with(~ code_map[.x], .cols = any_of(names(code_map))) %>%
+  mutate(
+    pct_poverty     = 100 * pov_count    / pmax(pop_total, 1),
+    pct_white       = 100 * white_count  / pmax(pop_total, 1),
+    pct_black       = 100 * black_count  / pmax(pop_total, 1),
+    pct_hispanic    = 100 * hisp_count   / pmax(pop_total, 1),
+    pct_foreign_born = 100 * foreign_born / pmax(pop_total, 1)
+  )
+
+# Optional: drop very small-population tracts to avoid unstable rates
+acs_wide <- acs_wide %>%
+  filter(pop_total >= 200)   # threshold can be 100 or 200; 200 is safer
+
+# Keep unique tract geometries & merge attributes
+tract_sf <- acs_geo %>%
+  select(GEOID, geometry) %>%
+  distinct() %>%
+  left_join(acs_wide, by = "GEOID") %>%
+  st_transform(4326) %>%
+  clean_names()       # geoID -> geoid, etc.
+
+# Compute area in square miles
+tract_sf <- tract_sf %>%
+  mutate(
+    area_sq_meters = st_area(geometry),
+    area_sq_miles  = as.numeric(area_sq_meters) * 3.861e-7
+  )
+```
+
+# 3. Spatial join: assign each inspection to a census tract
+
+This chunk links each inspection point to the census tract polygon it falls within. Using st_join with st_within, we attache tract information from tract_sf (ACS data + geometry) to each inspection point in dohmh_sf, creating merged_sf. That means each inspection now has the tract’s GEOID and demographic variables. Then we drop the geometry to get a regular data frame (analysis_df) for tabular work and cleans column names. We also create an income_decile variable: for any inspection with a non-missing median_income, it assigns the tract to one of 10 deciles, ranking tracts from lowest to highest median income. This is so that we have data for stratified analysis by neighborhood income.
+
+
+```{r}
+merged_sf <- st_join(dohmh_sf, tract_sf, join = st_within, left = TRUE)
+
+analysis_df <- merged_sf %>%
+  st_drop_geometry() %>%
+  clean_names() %>%
+  mutate(
+    income_decile = ifelse(!is.na(median_income),
+                           ntile(median_income, 10),
+                           NA_integer_)
+  )
+```
+
+# 4. Restaurant-level and tract-level summaries
+
+## 4.1 Restaurant-level
+
+Here we collapse the inspection data down to the restaurant level. The code filters out rows with missing geoid, groups by restaurant identifier (camis) and tract (geoid), and summarizes the following: 
+
+- n_inspections is how many inspections that restaurant had over the period
+- avg_score is the average inspection score (ignoring missing scores)
+- last_grade is the last observed grade in the data (using dplyr::last). 
+
+The result, rest_level, has one row per restaurant (within tract) and captures both volume of inspections and basic performance.
+
+```{r}
+rest_level <- analysis_df %>%
+  filter(!is.na(geoid)) %>%
+  group_by(camis, geoid) %>%
+  summarise(
+    n_inspections = n(),
+    avg_score     = mean(score, na.rm = TRUE),
+    last_grade    = dplyr::last(grade),
+    .groups = "drop"
+  )
+```
+
+## 4.2 Tract-level: restaurants, inspections, frequency
+
+This chunk builds tract-level summary metrics for restaurants and inspections, then merges them with the ACS and geometry. First, tract_rest_counts counts how many distinct restaurants there are in each tract and the total number of inspections across those restaurants (using rest_level). Next, tract_inspections independently counts the raw number of inspection events per tract from the full analysis_df (should generally align with the restaurant aggregation but kept separate for robustness). Then, tract_level merges these counts into tract_sf (which already has demographics and geometry) by geoid. We then compute several derived variables:
+
+- inspections_per_rest: total inspections divided by number of restaurants in the tract.
+- inspections_per_rest_per_year: that value divided by 5, assuming a 5-year period, giving an average per restaurant per year.
+- restaurants_per_1000_pop: restaurant density per 1,000 residents.
+- inspections_per_sq_mile: total inspections divided by the tract’s land area in square miles - inspection intensity by land area.
+- inspections_per_1000_pop: total inspections per 1,000 residents - inspection intensity adjusted for population.
+
+
+```{r}
+# Number of restaurants and total inspections per tract
+tract_rest_counts <- rest_level %>%
+  group_by(geoid) %>%
+  summarise(
+    n_restaurants          = n(),
+    total_rest_inspections = sum(n_inspections),
+    .groups = "drop"
+  )
+
+# Total raw inspection events per tract (should match, but keep separate)
+tract_inspections <- analysis_df %>%
+  filter(!is.na(geoid)) %>%
+  group_by(geoid) %>%
+  summarise(
+    total_inspections = n(),
+    .groups = "drop"
+  )
+
+# Merge with ACS / geometry & compute key derived vars
+tract_level <- tract_sf %>%
+  left_join(tract_rest_counts, by = "geoid") %>%
+  left_join(tract_inspections, by = "geoid")
+
+# Cleaned version for analysis: must have pop + at least 1 restaurant + at least 1 inspection
+tract_level_clean <- tract_level %>%
+  filter(
+    !is.na(pop_total),
+    pop_total >= 200,
+    !is.na(n_restaurants),
+    n_restaurants > 0,
+    !is.na(total_inspections),
+    total_inspections > 0
+  ) %>%
+  mutate(
+    inspections_per_rest     = total_inspections / n_restaurants,
+    inspections_per_sq_mile  = total_inspections / pmax(area_sq_miles, 1e-6),
+    inspections_per_1000_pop = 1000 * total_inspections / pop_total,
+    restaurants_per_1000_pop = 1000 * n_restaurants / pop_total
+  )
+```
+
+# 5. Descriptive statistics & correlations
+
+This chunk prepares and runs some basic descriptive statistics. tract_level_nongeom drops the spatial geometry from tract_level to get a plain data frame for use in non-spatial functions. tract_skim_df selects a subset of key variables: inspection intensity per restaurant, median income, poverty rate, racial composition, and restaurants per 1,000 people. datasummary_skim then creates a summary table of numeric variables (means, SDs, min/max, etc.) for quick descriptive stats. After that, cor_matrix computes a correlation matrix for the main variables of interest (inspections per restaurant, income, poverty, racial shares, foreign-born share) using pairwise complete observations. This helps us see how inspection intensity relates to neighborhood characteristics at a high level.
+
+```{r}
+# Drop geometry before feeding into modelsummary
+tract_level_nongeom <- tract_level_clean %>%
+  st_drop_geometry()
+
+# Summary stats table: tract-level variables we actually use
+tract_skim_df <- tract_level_nongeom %>%
+  select(
+    inspections_per_1000_pop,
+    inspections_per_rest,
+    median_income,
+    pct_poverty,
+    pct_white,
+    pct_black,
+    pct_hispanic,
+    restaurants_per_1000_pop
+  )
+
+datasummary_skim(
+  tract_skim_df,
+  type = "numeric"
+)
+
+# Simple correlation matrix for main vars
+cor_matrix <- tract_level_nongeom %>%
+  select(
+    inspections_per_1000_pop,
+    median_income, pct_poverty,
+    pct_white, pct_black, pct_hispanic, pct_foreign_born
+  ) %>%
+  cor(use = "pairwise.complete.obs")
+
+cor_matrix
+```
+
+# 6. Descriptive plots for your presentation
+
+## 6.1 Map: inspections per mile
+
+In this chunk we are creating a choropleth map showing inspection intensity per square mile across census tracts. We use ggplot with geom_sf, mapping the fill color of each tract to inspections_per_sq_mile. We then use a viridis color scale (magma palette) with a log transformation, which helps visualize variation when the data are skewed (some tracts with extremely high densities). Missing values are colored light grey. The result is a city-wide map showing where inspections are geographically concentrated by land area.
+
+```{r}
+ggplot(tract_level_clean) +
+  geom_sf(aes(fill = inspections_per_sq_mile), color = NA) +
+  scale_fill_viridis_c(option = "magma", trans = "log", na.value = "grey90") +
+  theme_minimal() +
+  labs(
+    title = "NYC Census Tracts: Inspections per Square Mile (2019–2023)",
+    fill  = "Inspections\nper Sq Mile"
+  )
+```
+
+
+## 6.2 Inspection intensity per 1,000 residents
+
+In this chunk we produce another choropleth, this time mapping inspection intensity per person rather than per area. We use ggplot with geom_sf, filling each tract by inspections_per_1000_pop (total inspections per 1,000 residents). The viridis plasma scale is again log-transformed to handle skewness and uses a neutral color for missing values. This lets us visually compare neighborhoods on an inspection-per-capita basis, which accounts for differences in population density.
+
+```{r}
+# Step 1: bin into low/med/high
+tract_level_binned <- tract_level_clean %>%
+  mutate(
+    # Step 1 — numeric tertile (ignore NAs safely)
+    insp_cat_num = ifelse(
+      is.na(inspections_per_1000_pop),
+      NA_integer_,
+      ntile(inspections_per_1000_pop, 3)
+    ),
+
+    # Step 2 — convert to factor
+    insp_cat = factor(
+      insp_cat_num,
+      levels = 1:3,
+      labels = c("Low", "Medium", "High")
+    )
+  )
+
+ggplot(tract_level_binned) +
+  geom_sf(aes(fill = insp_cat), color = NA) +
+  scale_fill_manual(
+    name   = "Inspection Intensity",
+    values = c(
+      "Low"    = "#2C7BB6",   # bright blue
+      "Medium" = "#FDAE61",   # strong orange
+      "High"   = "#D7191C"    # vivid red
+    ),
+    na.value = "grey90"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "NYC Census Tracts: Low / Medium / High Inspections per 1,000 Residents (2019–2023)",
+    fill  = "Inspections\nper 1,000 residents"
+  )
+```
+
+## 6.3 Scatter: income vs inspections per restaurant
+
+**Bivariate map**
+
+Here, we create tract_bivar by filtering to tracts with non-missing median income and inspections_per_sq_mile. It then splits median income into three tertiles (income_tertile) and inspection intensity into three tertiles (insp_tertile). Combining them gives a nine-category bivar_cat variable (e.g., “1-3” = lowest income, highest inspection intensity).
+
+bivar_pal defines a custom 3×3 color palette mapping each combination of income and inspection tertiles to a distinct color (light or dark, warm or cool).
+
+The ggplot that follows uses geom_sf with fill = bivar_cat and scale_fill_manual(values = bivar_pal) to draw a bivariate choropleth map. The title and subtitle explain that rows represent income levels and columns represent inspection intensity levels. Minimal theme and no axis text/grid keep the focus on the color patterns.
+
+**Bivariate legend**
+
+legend_df builds a simple 3×3 grid of income x inspection levels with a cat column matching the bivariate categories.
+
+A second ggplot uses geom_tile to show a small matrix: x-axis is inspection intensity (Low/Med/High), y-axis is income (Low/Med/High). Tiles are colored using the same bivar_pal. This provides a standalone legend that helps interpret the bivariate map’s color combinations.
+
+Together, this chunk gives us a combined bivariate map that visualizes how the two dimensions interact across space.
+
+```{r}
+
+## Bivariate Map
+tract_bivar <- tract_level_clean %>%
+  filter(!is.na(median_income),
+         !is.na(inspections_per_sq_mile)) %>%
+  mutate(
+    income_tertile = ntile(median_income, 3),
+    insp_tertile   = ntile(inspections_per_sq_mile, 3),
+    bivar_cat = factor(
+      paste0(income_tertile, "-", insp_tertile),
+      levels = c("1-1", "1-2", "1-3",
+                 "2-1", "2-2", "2-3",
+                 "3-1", "3-2", "3-3")
+    )
+  )
+
+bivar_pal <- c(
+  "1-1" = "#e8e8e8", # low income, low inspections
+  "1-2" = "#b8d6be",
+  "1-3" = "#64acbe",
+
+  "2-1" = "#ace4e4",
+  "2-2" = "#80bfac",
+  "2-3" = "#4f908e",
+
+  "3-1" = "#9ebcda", # high income, low inspections
+  "3-2" = "#8c62aa",
+  "3-3" = "#3b4994"  # high income, high inspections
+)
+
+ggplot(tract_bivar) +
+  geom_sf(aes(fill = bivar_cat), color = NA) +
+  scale_fill_manual(
+    values = bivar_pal,
+    na.value = "grey90",
+    name = "Income × Inspection\nIntensity"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "NYC Census Tracts: Income and Inspection Intensity (Bivariate Choropleth)",
+    subtitle = "Income (rows) × Inspections per Square Mile (columns)",
+    caption = "Inspection data: DOHMH 2019–2023 · Income: ACS 2022"
+  ) +
+  theme(
+    legend.position = "right",
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank()
+  )
+
+legend_df <- expand.grid(
+  income = 1:3,
+  insp = 1:3
+) %>%
+  mutate(cat = paste0(income, "-", insp))
+
+ggplot(legend_df, aes(x = insp, y = income, fill = cat)) +
+  geom_tile() +
+  scale_fill_manual(values = bivar_pal) +
+  scale_x_continuous(breaks = 1:3, labels = c("Low", "Med", "High")) +
+  scale_y_continuous(breaks = 1:3, labels = c("Low", "Med", "High")) +
+  labs(
+    x = "Inspection Intensity",
+    y = "Income",
+    fill = NULL,
+    title = "Bivariate Legend"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.title = element_text(size = 10)
+  )
+
+
+```
+
+## 6.4 Density by income decile
+
+In this chunk we look at the distribution of inspection intensity per restaurant across different income levels. First, it takes the non-spatial tract_level_nongeom and recomputes income_decile at the tract level, assigning each tract to one of ten deciles based on median_income (lowest 10%, next 10%, etc.). Then, using ggplot, we plot density curves of inspections_per_rest with one density curve for each income decile (distinguished by fill color). This shows how the distribution of inspections per restaurant shifts across poorer versus richer tracts e.g., whether low-income areas tend to have higher or lower inspection intensity per restaurant.
+
+```{r}
+
+# Create intuitive decile labels
+tract_level_deciles <- tract_level_nongeom %>%
+  filter(!is.na(median_income)) %>%
+  mutate(
+    income_decile = ntile(median_income, 10)
+  )
+
+tract_summary <- tract_level_deciles %>%
+  group_by(income_decile) %>%
+  summarise(
+    median_insp = median(inspections_per_rest, na.rm = TRUE),
+    q1 = quantile(inspections_per_rest, 0.25, na.rm = TRUE),
+    q3 = quantile(inspections_per_rest, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    income_decile_label = factor(
+      income_decile,
+      levels = 1:10,
+      labels = paste0(
+        1:10,
+        c(" (lowest income)", rep("", 8), " (highest income)")
+      )
+    )
+  )
+
+ggplot(tract_summary,
+       aes(x = income_decile_label,
+           y = median_insp)) +
+  geom_point(size = 3, color = "#1f78b4") +
+  geom_errorbar(aes(ymin = q1, ymax = q3),
+                width = 0.2, color = "#1f78b4") +
+  labs(
+    x = "Income Decile (1 = lowest-income neighborhoods, 10 = highest)",
+    y = "Median (IQR) Inspections per Restaurant",
+    title = "Inspection Intensity Across Neighborhood Income Levels"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)  # readable labels
+  )
+
+```
+
+
+
+
+# 7. Other EDA
+
+```{r}
+dohmh %>%
+  mutate(year = lubridate::year(inspection_date)) %>%
+  group_by(year) %>%
+  summarise(
+    unique_restaurants = n_distinct(camis)
+  ) %>%
+  arrange(year)
+```
+
+```{r}
+dohmh %>%
+  mutate(year = lubridate::year(inspection_date)) %>%
+  count(year) %>%
+  ggplot(aes(year, n)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Total Inspections per Year", y = "Inspections")
+
+```
+
+```{r}
+tract_level %>%
+  summarize(total_tracts = n_distinct(geoid))
+```
+
+```{r}
+# Identify the top/bottom tracts
+top_tracts <- tract_level %>%
+  select(geoid, total_inspections) %>%
+  arrange(desc(total_inspections)) %>%
+  slice(1:5)
+
+bottom_tracts <- tract_level %>%
+  select(geoid, total_inspections) %>%
+  arrange(total_inspections) %>%
+  slice(1:5)
+
+top_tracts
+bottom_tracts
+```
+
+```{r}
+dohmh %>%
+  mutate(month = floor_date(inspection_date, "month")) %>%
+  count(month) %>%
+  ggplot(aes(month, n)) +
+  geom_line() +
+  labs(title = "Monthly Inspection Volume")
+```
+
+```{r}
+# 1. Pick years to show
+years_to_plot <- 2019:2023   # tweak as you like
+
+# 2. Use the sf object (points) and filter to NYC bounds
+dohmh_years_sf <- dohmh_sf %>%
+  mutate(year = year(inspection_date)) %>%
+  filter(
+    !is.na(year),
+    year %in% years_to_plot,
+    longitude > -75, longitude < -72,   # drop bad coords
+    latitude  >  40, latitude  <  42
+  )
+
+# 3. Faceted map: polygons + inspection points
+ggplot() +
+  geom_sf(data = tract_sf,
+          fill  = "grey95",
+          color = "grey75",
+          size  = 0.1) +
+  geom_sf(data = dohmh_years_sf,
+          color = "red",
+          alpha = 0.35,
+          size  = 0.4) +
+  coord_sf(
+    xlim = c(-74.3, -73.6),  # NYC-ish window
+    ylim = c(40.48, 40.95),
+    expand = FALSE
+  ) +
+  facet_wrap(~ year) +
+  theme_minimal() +
+  labs(
+    title    = "NYC DOHMH Restaurant Inspections by Year",
+    subtitle = "Census tracts with sampled inspection points",
+    caption  = "Source: NYC Open Data – DOHMH Inspections",
+    x = NULL, y = NULL
+  )
+
+```
+
+# 8. Basic Regressions
+
+## OLS Model Description
+
+We estimate the following ordinary least squares (OLS) model:
+
+**Inspections per 1,000 residents<sub>i</sub> = β₀ + β₁ · Median Income<sub>i</sub> + ε<sub>i</sub>**
+
+### Outcome (Y)
+The number of restaurant inspections per 1,000 residents in census tract *i*.
+
+### Predictor (X)
+Median household income in census tract *i*.
+
+### Coefficient β₁
+Indicates how inspection intensity changes as median income increases.  
+A positive value suggests higher-income tracts experience more inspections per 1,000 residents;  
+a negative value suggests they experience fewer.
+
+### Significance
+Tests whether the relationship between income and inspection intensity is statistically meaningful rather than due to chance.
+
+### R²
+Represents the proportion of variation in inspections per square mile explained solely by median income.
+
+```{r}
+tract_reg_df <- tract_level_nongeom %>%
+  filter(
+    !is.na(inspections_per_1000_pop),
+    !is.na(median_income),
+    !is.na(pct_poverty),
+    !is.na(pct_white),
+    !is.na(pct_black),
+    !is.na(pct_hispanic),
+    !is.na(pct_foreign_born)
+  )
+
+## Model 1: Income only
+
+mod_income_only <- lm(
+  inspections_per_1000_pop ~ median_income,
+  data = tract_reg_df
+)
+
+## Model 2: Income + demographic controls
+
+mod_with_controls <- lm(
+  inspections_per_1000_pop ~ median_income +
+    pct_poverty + pct_white + pct_black +
+    pct_hispanic + pct_foreign_born,
+  data = tract_reg_df
+)
+
+modelsummary(
+  list(
+    "Income only"     = mod_income_only,
+    "Income + controls" = mod_with_controls
+  ),
+  stars = TRUE,
+  gof_omit = "IC|F"
+)
+```
+
+# Save all key objects used in the slides
+```{R}
+save(
+  dohmh,
+  dohmh_sf,
+  tract_sf,
+  tract_level,
+  tract_level_clean,
+  tract_level_nongeom,
+  analysis_df,
+  rest_level,
+  tract_reg_df,
+  tract_skim_df,
+  tract_level_binned,
+  tract_bivar,
+  bivar_pal,
+  legend_df,
+  tract_summary,
+  file = "final_project_objects.RData"
+)
+
+```
